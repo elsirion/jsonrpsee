@@ -31,6 +31,7 @@ use crate::transport::HttpTransportClient;
 use crate::types::{ErrorResponse, Id, NotificationSer, RequestSer, Response};
 use async_trait::async_trait;
 use hyper::http::HeaderMap;
+use hyper::Uri;
 use jsonrpsee_core::client::{CertificateStore, ClientT, IdKind, RequestIdManager, Subscription, SubscriptionClientT};
 use jsonrpsee_core::params::BatchRequestBuilder;
 use jsonrpsee_core::traits::ToRpcParams;
@@ -73,6 +74,7 @@ pub struct HttpClientBuilder {
 	id_kind: IdKind,
 	max_log_length: u32,
 	headers: HeaderMap,
+	socks_proxy: Option<Uri>,
 }
 
 impl HttpClientBuilder {
@@ -122,6 +124,12 @@ impl HttpClientBuilder {
 		self
 	}
 
+	/// Forward connections via SOCKS5 proxy
+	pub fn set_socks5_proxy(mut self, proxy: Uri) -> Self {
+		self.socks_proxy = Some(proxy);
+		self
+	}
+
 	/// Build the HTTP client with target to connect to.
 	pub fn build(self, target: impl AsRef<str>) -> Result<HttpClient, Error> {
 		let transport = HttpTransportClient::new(
@@ -130,6 +138,7 @@ impl HttpClientBuilder {
 			self.certificate_store,
 			self.max_log_length,
 			self.headers,
+			self.socks_proxy,
 		)
 		.map_err(|e| Error::Transport(e.into()))?;
 		Ok(HttpClient {
@@ -150,6 +159,7 @@ impl Default for HttpClientBuilder {
 			id_kind: IdKind::Number,
 			max_log_length: 4096,
 			headers: HeaderMap::new(),
+			socks_proxy: None,
 		}
 	}
 }

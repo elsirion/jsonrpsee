@@ -9,6 +9,7 @@
 use hyper::client::{Client, HttpConnector};
 use hyper::http::{HeaderMap, HeaderValue};
 use hyper::Uri;
+use hyper_socks2::SocksConnector;
 use jsonrpsee_core::client::CertificateStore;
 use jsonrpsee_core::error::GenericTransportError;
 use jsonrpsee_core::http_helpers;
@@ -24,6 +25,11 @@ enum HyperClient {
 	Https(Client<hyper_rustls::HttpsConnector<HttpConnector>>),
 	/// Hyper client with http connector.
 	Http(Client<HttpConnector>),
+	/// SOCKS5-proxied Hyper client with https connector.
+	#[cfg(feature = "tls")]
+	HttpsSocks(Client<hyper_rustls::HttpsConnector<SocksConnector<HttpConnector>>>),
+	/// SOCKS5-proxied Hyper client with http connector.
+	HttpSocks(Client<SocksConnector<HttpConnector>>),
 }
 
 impl HyperClient {
@@ -32,6 +38,9 @@ impl HyperClient {
 			Self::Http(client) => client.request(req),
 			#[cfg(feature = "tls")]
 			Self::Https(client) => client.request(req),
+			#[cfg(feature = "tls")]
+			HyperClient::HttpsSocks(client) => client.request(req),
+			HyperClient::HttpSocks(client) => client.request(req),
 		}
 	}
 }
@@ -61,30 +70,38 @@ impl HttpTransportClient {
 		cert_store: CertificateStore,
 		max_log_length: u32,
 		headers: HeaderMap,
+		socks_proxy: Option<Uri>,
 	) -> Result<Self, Error> {
 		let target: Uri = target.as_ref().parse().map_err(|e| Error::Url(format!("Invalid URL: {}", e)))?;
 		if target.port_u16().is_none() {
 			return Err(Error::Url("Port number is missing in the URL".into()));
 		}
 
-		let client = match target.scheme_str() {
-			Some("http") => HyperClient::Http(Client::new()),
+		let socks_connector =
+			socks_proxy.map(|proxy_addr| {
+				let mut tcp_connector = HttpConnector::new();
+				// We kind of abuse the HTTP connector to open the SOCKS5/TCP connections for us
+				tcp_connector.enforce_http(false);
+				SocksConnector { proxy_addr, auth: None, connector: tcp_connector }
+			});
+
+		let client = match (target.scheme_str(), socks_connector) {
+			(Some("http"), None) => HyperClient::Http(Client::new()),
+			(Some("http"), Some(connector)) => HyperClient::HttpSocks(Client::builder().build(connector)),
 			#[cfg(feature = "tls")]
-			Some("https") => {
-				let connector = match cert_store {
-					CertificateStore::Native => hyper_rustls::HttpsConnectorBuilder::new()
-						.with_native_roots()
-						.https_or_http()
-						.enable_http1()
-						.build(),
-					CertificateStore::WebPki => hyper_rustls::HttpsConnectorBuilder::new()
-						.with_webpki_roots()
-						.https_or_http()
-						.enable_http1()
-						.build(),
+			(Some("https"), socks_connector) => {
+				let connector_builder = match cert_store {
+					CertificateStore::Native => hyper_rustls::HttpsConnectorBuilder::new().with_native_roots(),
+					CertificateStore::WebPki => hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots(),
 					_ => return Err(Error::InvalidCertficateStore),
 				};
-				HyperClient::Https(Client::builder().build::<_, hyper::Body>(connector))
+				let connector_builder = connector_builder.https_or_http().enable_http1();
+				match socks_connector {
+					None => HyperClient::Https(Client::builder().build::<_, hyper::Body>(connector_builder.build())),
+					Some(socks_connector) => HyperClient::HttpsSocks(
+						Client::builder().build::<_, hyper::Body>(connector_builder.wrap_connector(socks_connector)),
+					),
+				}
 			}
 			_ => {
 				#[cfg(feature = "tls")]
@@ -196,6 +213,8 @@ where
 
 #[cfg(test)]
 mod tests {
+	use jsonrpsee_core::client::ClientT;
+	use crate::HttpClientBuilder;
 	use super::*;
 
 	fn assert_target(
@@ -215,7 +234,7 @@ mod tests {
 
 	#[test]
 	fn invalid_http_url_rejected() {
-		let err = HttpTransportClient::new("ws://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new())
+		let err = HttpTransportClient::new("ws://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new(), None)
 			.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
 	}
@@ -224,7 +243,7 @@ mod tests {
 	#[test]
 	fn https_works() {
 		let client =
-			HttpTransportClient::new("https://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new())
+			HttpTransportClient::new("https://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new(), None)
 				.unwrap();
 		assert_target(&client, "localhost", "https", "/", 9933, 80);
 	}
@@ -233,18 +252,18 @@ mod tests {
 	#[test]
 	fn https_fails_without_tls_feature() {
 		let err =
-			HttpTransportClient::new("https://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new())
+			HttpTransportClient::new("https://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new(), None)
 				.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
 	}
 
 	#[test]
 	fn faulty_port() {
-		let err = HttpTransportClient::new("http://localhost:-43", 80, CertificateStore::Native, 80, HeaderMap::new())
+		let err = HttpTransportClient::new("http://localhost:-43", 80, CertificateStore::Native, 80, HeaderMap::new(), None)
 			.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
 		let err =
-			HttpTransportClient::new("http://localhost:-99999", 80, CertificateStore::Native, 80, HeaderMap::new())
+			HttpTransportClient::new("http://localhost:-99999", 80, CertificateStore::Native, 80, HeaderMap::new(), None)
 				.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
 	}
@@ -257,6 +276,7 @@ mod tests {
 			CertificateStore::Native,
 			80,
 			HeaderMap::new(),
+			None
 		)
 		.unwrap();
 		assert_target(&client, "localhost", "http", "/my-special-path", 9944, 1337);
@@ -270,6 +290,7 @@ mod tests {
 			CertificateStore::WebPki,
 			80,
 			HeaderMap::new(),
+			None
 		)
 		.unwrap();
 		assert_target(&client, "127.0.0.1", "http", "/my?name1=value1&name2=value2", 9999, u32::MAX);
@@ -283,6 +304,7 @@ mod tests {
 			CertificateStore::Native,
 			80,
 			HeaderMap::new(),
+			None
 		)
 		.unwrap();
 		assert_target(&client, "127.0.0.1", "http", "/my.htm", 9944, 999);
@@ -292,7 +314,7 @@ mod tests {
 	async fn request_limit_works() {
 		let eighty_bytes_limit = 80;
 		let client =
-			HttpTransportClient::new("http://localhost:9933", 80, CertificateStore::WebPki, 99, HeaderMap::new())
+			HttpTransportClient::new("http://localhost:9933", 80, CertificateStore::WebPki, 99, HeaderMap::new(), None)
 				.unwrap();
 		assert_eq!(client.max_request_body_size, eighty_bytes_limit);
 
